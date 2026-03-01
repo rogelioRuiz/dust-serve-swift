@@ -11,7 +11,7 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(name: "dust-core-swift", path: "../dust-core-swift"),
+        .package(url: "https://github.com/rogelioRuiz/dust-core-swift.git", from: "0.1.0"),
     ],
     targets: [
         .target(
