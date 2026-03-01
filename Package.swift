@@ -26,5 +26,6 @@ let package = Package(
             dependencies: ["DustServe"],
             path: "Tests/DustServeTests"
         )
-    ]
+    ],
+    swiftLanguageVersions: [.v5]
 )

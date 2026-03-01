@@ -10,4 +10,4 @@ jobs:
           repository: rogelioRuiz/dust-core-swift
           path: dust-core-swift
       - run: ln -s $GITHUB_WORKSPACE/dust-core-swift ../dust-core-swift
-      - run: swift build -Xswiftc -swift-version -Xswiftc 5 && swift test -Xswiftc -swift-version -Xswiftc 5
+      - run: swift build && swift test
