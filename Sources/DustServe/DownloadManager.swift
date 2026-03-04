@@ -191,7 +191,10 @@ public final class DownloadManager: @unchecked Sendable {
         }
 
         try fileManager.moveItem(at: partFileURL, to: finalFileURL)
-        stateStore.setStatus(.ready, for: descriptor.id)
+        stateStore.updateState(for: descriptor.id) { state in
+            state.status = .ready
+            state.filePath = finalFileURL.path
+        }
         eventEmitter("modelReady", [
             "modelId": descriptor.id,
             "path": finalFileURL.path,
