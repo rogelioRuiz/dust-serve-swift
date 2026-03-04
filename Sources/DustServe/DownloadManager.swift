@@ -2,6 +2,15 @@ import CryptoKit
 import Foundation
 import DustCore
 
+// MARK: - Manifest types for multi-file model downloads (e.g. MLX)
+
+struct ManifestFileEntry: Codable, Sendable {
+    let filename: String
+    let url: String
+    let sha256: String
+    let sizeBytes: Int64
+}
+
 public final class DownloadManager: @unchecked Sendable {
     private static let progressEventIntervalBytes: Int64 = 1_048_576
 
@@ -14,6 +23,7 @@ public final class DownloadManager: @unchecked Sendable {
     private let fileManager: FileManager
     private let lock = NSLock()
     private var activeDownloads: [String: ActiveDownload] = [:]
+    private var pendingReconnections: [String: AsyncThrowingStream<DownloadChunk, Error>] = [:]
 
     public init(
         dataSource: DownloadDataSource,
@@ -35,19 +45,52 @@ public final class DownloadManager: @unchecked Sendable {
 
     @discardableResult
     public func download(_ descriptor: DustModelDescriptor) -> Task<Void, Never> {
-        guard let urlString = descriptor.url, let url = URL(string: urlString) else {
-            return failImmediately(
-                for: descriptor,
-                error: .downloadFailed(detail: "Model descriptor is missing a valid download URL")
-            )
+        let manifest = parseManifest(from: descriptor)
+
+        if manifest == nil {
+            guard let urlString = descriptor.url, let url = URL(string: urlString) else {
+                return failImmediately(
+                    for: descriptor,
+                    error: .downloadFailed(detail: "Model descriptor is missing a valid download URL")
+                )
+            }
+
+            guard let expectedHash = descriptor.sha256?.lowercased(), !expectedHash.isEmpty else {
+                return failImmediately(
+                    for: descriptor,
+                    error: .verificationFailed(detail: "Model descriptor is missing a SHA-256 checksum")
+                )
+            }
+
+            lock.lock()
+            if let existing = activeDownloads[descriptor.id] {
+                if !existing.isFinished, let existingTask = existing.task {
+                    lock.unlock()
+                    return existingTask
+                }
+                activeDownloads.removeValue(forKey: descriptor.id)
+            }
+
+            let entry = ActiveDownload(url: url)
+            let task = Task {
+                await Task.yield()
+                do {
+                    try await runDownload(descriptor: descriptor, url: url, expectedHash: expectedHash)
+                } catch {
+                    handleFailure(for: descriptor, error: error)
+                }
+                finishDownload(for: descriptor.id, entry: entry)
+            }
+            entry.task = task
+            activeDownloads[descriptor.id] = entry
+            lock.unlock()
+
+            return task
         }
 
-        guard let expectedHash = descriptor.sha256?.lowercased(), !expectedHash.isEmpty else {
-            return failImmediately(
-                for: descriptor,
-                error: .verificationFailed(detail: "Model descriptor is missing a SHA-256 checksum")
-            )
-        }
+        // Manifest-based multi-file download (e.g. MLX models)
+        let manifestEntries = manifest!
+        let placeholderURL = URL(string: manifestEntries[0].url)!
 
         lock.lock()
         if let existing = activeDownloads[descriptor.id] {
@@ -58,11 +101,11 @@ public final class DownloadManager: @unchecked Sendable {
             activeDownloads.removeValue(forKey: descriptor.id)
         }
 
-        let entry = ActiveDownload(url: url)
+        let entry = ActiveDownload(url: placeholderURL)
         let task = Task {
             await Task.yield()
             do {
-                try await runDownload(descriptor: descriptor, url: url, expectedHash: expectedHash)
+                try await runManifestDownload(descriptor: descriptor, manifest: manifestEntries)
             } catch {
                 handleFailure(for: descriptor, error: error)
             }
@@ -206,6 +249,165 @@ public final class DownloadManager: @unchecked Sendable {
         ])
     }
 
+    private func parseManifest(from descriptor: DustModelDescriptor) -> [ManifestFileEntry]? {
+        guard let filesJSON = descriptor.metadata?["files"],
+              let data = filesJSON.data(using: .utf8),
+              let entries = try? JSONDecoder().decode([ManifestFileEntry].self, from: data),
+              !entries.isEmpty else {
+            return nil
+        }
+        return entries
+    }
+
+    private func runManifestDownload(
+        descriptor: DustModelDescriptor,
+        manifest: [ManifestFileEntry]
+    ) async throws {
+        guard networkPolicyProvider.isDownloadAllowed() else {
+            throw DustCoreError.networkPolicyBlocked(
+                detail: "Current connection does not satisfy the active network policy"
+            )
+        }
+
+        let availableBytes = max(diskSpaceProvider.availableBytes(at: baseDirectory), 0)
+        let requiredBytes = descriptor.sizeBytes > (Int64.max / 2)
+            ? Int64.max
+            : max(descriptor.sizeBytes, 0) * 2
+        guard availableBytes >= requiredBytes else {
+            throw DustCoreError.storageFull(
+                detail: "Available bytes: \(availableBytes), required bytes: \(requiredBytes)"
+            )
+        }
+
+        let modelDirectory = baseDirectory
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(descriptor.id, isDirectory: true)
+        try fileManager.createDirectory(
+            at: modelDirectory,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+
+        stateStore.setStatus(.downloading(progress: 0), for: descriptor.id)
+        eventEmitter("sizeDisclosure", [
+            "modelId": descriptor.id,
+            "sizeBytes": descriptor.sizeBytes,
+        ])
+
+        var globalBytesDownloaded: Int64 = 0
+        let totalSize = max(descriptor.sizeBytes, 1)
+        var lastProgressEventBytes: Int64 = 0
+
+        for entry in manifest {
+            try Task.checkCancellation()
+
+            guard let url = URL(string: entry.url) else {
+                throw DustCoreError.downloadFailed(detail: "Invalid URL for file: \(entry.filename)")
+            }
+
+            let finalFileURL = modelDirectory.appendingPathComponent(entry.filename, isDirectory: false)
+            let partFileURL = modelDirectory.appendingPathComponent("\(entry.filename).part", isDirectory: false)
+
+            // Skip already-downloaded and verified files (resume support)
+            if fileManager.fileExists(atPath: finalFileURL.path) {
+                if verifyFileHash(at: finalFileURL, expected: entry.sha256.lowercased()) {
+                    globalBytesDownloaded += entry.sizeBytes
+                    let progress = min(Float(globalBytesDownloaded) / Float(totalSize), 1)
+                    stateStore.setStatus(.downloading(progress: progress), for: descriptor.id)
+                    continue
+                }
+                try fileManager.removeItem(at: finalFileURL)
+            }
+
+            if fileManager.fileExists(atPath: partFileURL.path) {
+                try fileManager.removeItem(at: partFileURL)
+            }
+
+            let (_, chunks) = try await dataSource.download(from: url)
+
+            fileManager.createFile(atPath: partFileURL.path, contents: nil)
+            let fileHandle = try FileHandle(forWritingTo: partFileURL)
+            defer { try? fileHandle.close() }
+
+            var hasher = SHA256()
+            var fileBytesReceived: Int64 = 0
+
+            for try await chunk in chunks {
+                try Task.checkCancellation()
+
+                if !chunk.data.isEmpty {
+                    hasher.update(data: chunk.data)
+                    try fileHandle.write(contentsOf: chunk.data)
+                }
+
+                fileBytesReceived = chunk.totalBytesReceived
+                let overallProgress = min(Float(globalBytesDownloaded + fileBytesReceived) / Float(totalSize), 1)
+                stateStore.setStatus(.downloading(progress: overallProgress), for: descriptor.id)
+
+                let currentGlobalBytes = globalBytesDownloaded + fileBytesReceived
+                if shouldEmitProgress(currentBytes: currentGlobalBytes, lastEmittedBytes: lastProgressEventBytes) {
+                    emitProgress(
+                        modelId: descriptor.id,
+                        progress: overallProgress,
+                        bytesDownloaded: currentGlobalBytes,
+                        totalBytes: descriptor.sizeBytes > 0 ? descriptor.sizeBytes : nil
+                    )
+                    lastProgressEventBytes = currentGlobalBytes
+                }
+            }
+
+            try fileHandle.synchronize()
+
+            // Verify this file's SHA-256
+            stateStore.setStatus(.verifying, for: descriptor.id)
+            let actualHash = hexDigest(hasher.finalize())
+            guard actualHash == entry.sha256.lowercased() else {
+                throw DustCoreError.verificationFailed(
+                    detail: "File \(entry.filename): expected \(entry.sha256), received \(actualHash)"
+                )
+            }
+
+            if fileManager.fileExists(atPath: finalFileURL.path) {
+                try fileManager.removeItem(at: finalFileURL)
+            }
+            try fileManager.moveItem(at: partFileURL, to: finalFileURL)
+            globalBytesDownloaded += fileBytesReceived
+        }
+
+        // Emit final progress if needed
+        if globalBytesDownloaded > lastProgressEventBytes {
+            emitProgress(
+                modelId: descriptor.id,
+                progress: 1,
+                bytesDownloaded: globalBytesDownloaded,
+                totalBytes: descriptor.sizeBytes > 0 ? descriptor.sizeBytes : nil
+            )
+        }
+
+        // All files downloaded — set ready with directory path
+        stateStore.updateState(for: descriptor.id) { state in
+            state.status = .ready
+            state.filePath = modelDirectory.path
+        }
+        eventEmitter("modelReady", [
+            "modelId": descriptor.id,
+            "path": modelDirectory.path,
+        ])
+    }
+
+    private func verifyFileHash(at fileURL: URL, expected: String) -> Bool {
+        guard let fileHandle = try? FileHandle(forReadingFrom: fileURL) else { return false }
+        defer { try? fileHandle.close() }
+
+        var hasher = SHA256()
+        while true {
+            let data = fileHandle.readData(ofLength: 1_048_576)
+            if data.isEmpty { break }
+            hasher.update(data: data)
+        }
+        return hexDigest(hasher.finalize()) == expected
+    }
+
     private func handleFailure(for descriptor: DustModelDescriptor, error: Error) {
         cleanupPartialFile(for: descriptor.id)
 
@@ -244,6 +446,8 @@ public final class DownloadManager: @unchecked Sendable {
 
     /// Reconnects orphaned background downloads that survived an app kill.
     /// Call this before `cleanupStalePartFiles()`.
+    /// Downloads whose model ID has a descriptor are consumed immediately;
+    /// those without one are stashed until `attachReconnectedDownload(for:)` is called.
     public func resumeOrphanedDownloads(
         descriptorProvider: (String) -> DustModelDescriptor?
     ) async {
@@ -251,34 +455,66 @@ public final class DownloadManager: @unchecked Sendable {
         let reconnected = await bgEngine.reconnectPendingTasks()
 
         for download in reconnected {
-            guard let descriptor = descriptorProvider(download.modelId) else { continue }
-            let expectedHash = descriptor.sha256?.lowercased() ?? ""
-
-            lock.lock()
-            if activeDownloads[descriptor.id] != nil {
+            if let descriptor = descriptorProvider(download.modelId) {
+                attachStream(download.chunks, for: descriptor, url: download.url)
+            } else {
+                lock.lock()
+                pendingReconnections[download.modelId] = download.chunks
                 lock.unlock()
-                continue
             }
-            let entry = ActiveDownload(url: download.url)
-            let task = Task {
-                await Task.yield()
-                do {
-                    try await consumeReconnectedStream(
-                        descriptor: descriptor,
-                        chunks: download.chunks,
-                        expectedHash: expectedHash
-                    )
-                } catch {
-                    handleFailure(for: descriptor, error: error)
-                }
-                finishDownload(for: descriptor.id, entry: entry)
-            }
-            entry.task = task
-            activeDownloads[descriptor.id] = entry
-            lock.unlock()
-
-            stateStore.setStatus(.downloading(progress: 0), for: descriptor.id)
         }
+    }
+
+    /// Attaches a stashed reconnected download stream for a model that was just registered.
+    /// Call this from the plugin's `register()` path after the descriptor is available.
+    public func attachReconnectedDownload(for descriptor: DustModelDescriptor, url: URL? = nil) {
+        lock.lock()
+        guard let stream = pendingReconnections.removeValue(forKey: descriptor.id) else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        attachStream(stream, for: descriptor, url: url ?? URL(string: descriptor.url ?? "")!)
+    }
+
+    /// Whether there is a pending reconnection stream for the given model ID.
+    public func hasPendingReconnection(modelId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingReconnections[modelId] != nil
+    }
+
+    private func attachStream(
+        _ chunks: AsyncThrowingStream<DownloadChunk, Error>,
+        for descriptor: DustModelDescriptor,
+        url: URL
+    ) {
+        let expectedHash = descriptor.sha256?.lowercased() ?? ""
+
+        lock.lock()
+        if activeDownloads[descriptor.id] != nil {
+            lock.unlock()
+            return
+        }
+        let entry = ActiveDownload(url: url)
+        let task = Task {
+            await Task.yield()
+            do {
+                try await consumeReconnectedStream(
+                    descriptor: descriptor,
+                    chunks: chunks,
+                    expectedHash: expectedHash
+                )
+            } catch {
+                handleFailure(for: descriptor, error: error)
+            }
+            finishDownload(for: descriptor.id, entry: entry)
+        }
+        entry.task = task
+        activeDownloads[descriptor.id] = entry
+        lock.unlock()
+
+        stateStore.setStatus(.downloading(progress: 0), for: descriptor.id)
     }
 
     private func consumeReconnectedStream(
@@ -402,7 +638,14 @@ public final class DownloadManager: @unchecked Sendable {
             }
 
             let finalFileURL = modelDirectory.appendingPathComponent("\(modelId).bin", isDirectory: false)
-            if !fileManager.fileExists(atPath: finalFileURL.path) {
+            let remainingFiles = (try? fileManager.contentsOfDirectory(
+                at: modelDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            let hasCompletedFiles = fileManager.fileExists(atPath: finalFileURL.path)
+                || remainingFiles.contains(where: { $0.pathExtension != "part" })
+            if !hasCompletedFiles {
                 stateStore.setStatus(.notLoaded, for: modelId)
             }
         }
@@ -421,13 +664,26 @@ public final class DownloadManager: @unchecked Sendable {
     }
 
     private func cleanupPartialFile(for modelId: String) {
-        let partFileURL = baseDirectory
+        let modelDirectory = baseDirectory
             .appendingPathComponent("models", isDirectory: true)
             .appendingPathComponent(modelId, isDirectory: true)
-            .appendingPathComponent("\(modelId).part", isDirectory: false)
 
-        guard fileManager.fileExists(atPath: partFileURL.path) else { return }
-        try? fileManager.removeItem(at: partFileURL)
+        // Clean up single-file .part
+        let singlePartFile = modelDirectory.appendingPathComponent("\(modelId).part", isDirectory: false)
+        if fileManager.fileExists(atPath: singlePartFile.path) {
+            try? fileManager.removeItem(at: singlePartFile)
+        }
+
+        // Clean up manifest .part files (e.g. "config.json.part", "model.safetensors.part")
+        if let files = try? fileManager.contentsOfDirectory(
+            at: modelDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) {
+            for file in files where file.pathExtension == "part" {
+                try? fileManager.removeItem(at: file)
+            }
+        }
     }
 
     private func finishDownload(for modelId: String, entry: ActiveDownload) {
