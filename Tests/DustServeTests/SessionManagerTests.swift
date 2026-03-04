@@ -2,7 +2,7 @@ import XCTest
 @testable import DustServe
 import DustCore
 
-private actor MockModelSessionFactory: ModelSessionFactory {
+private actor MockModelSessionFactory: DustModelSessionFactory {
     private let errorToThrow: DustCoreError?
     private let delayNanoseconds: UInt64
     private let closeOrderRecorder: CloseOrderRecorder?

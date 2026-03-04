@@ -11,16 +11,23 @@ public final class SessionManager: @unchecked Sendable {
     public let inferenceQueue = DispatchQueue(label: "com.t6x.modelserver.inference")
 
     private let stateStore: ModelStateStore
-    private let factory: any ModelSessionFactory
+    private var factory: any DustModelSessionFactory
     private let lock = NSLock()
     private var cachedSessions: [String: CachedSession] = [:]
 
     public init(
         stateStore: ModelStateStore,
-        factory: any ModelSessionFactory
+        factory: any DustModelSessionFactory
     ) {
         self.stateStore = stateStore
         self.factory = factory
+    }
+
+    /// Swaps the session factory. Must be called before any sessions are loaded.
+    public func setFactory(_ newFactory: any DustModelSessionFactory) {
+        lock.lock(); defer { lock.unlock() }
+        precondition(cachedSessions.isEmpty, "Cannot swap factory while sessions are active")
+        factory = newFactory
     }
 
     public func loadModel(

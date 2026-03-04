@@ -1,14 +1,9 @@
 import Foundation
 import DustCore
 
-public protocol ModelSessionFactory: Sendable {
-    func makeSession(
-        descriptor: DustModelDescriptor,
-        priority: DustSessionPriority
-    ) async throws -> any DustModelSession
-}
+// DustModelSessionFactory protocol is defined in DustCore.
 
-public struct StubModelSessionFactory: ModelSessionFactory {
+public struct StubModelSessionFactory: DustModelSessionFactory {
     public init() {}
 
     public func makeSession(
