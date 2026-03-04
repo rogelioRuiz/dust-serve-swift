@@ -124,7 +124,12 @@ public final class DownloadManager: @unchecked Sendable {
 
         stateStore.setStatus(.downloading(progress: 0), for: descriptor.id)
 
-        let (preflight, chunks) = try await dataSource.download(from: url)
+        let (preflight, chunks): (DownloadPreflightInfo, AsyncThrowingStream<DownloadChunk, Error>)
+        if let bgEngine = dataSource as? BackgroundDownloadEngine {
+            (preflight, chunks) = try await bgEngine.download(from: url, modelId: descriptor.id)
+        } else {
+            (preflight, chunks) = try await dataSource.download(from: url)
+        }
         let disclosedSize = max(preflight.contentLength ?? descriptor.sizeBytes, 0)
         eventEmitter("sizeDisclosure", [
             "modelId": descriptor.id,
@@ -223,7 +228,151 @@ public final class DownloadManager: @unchecked Sendable {
         ])
     }
 
-    public func cleanupStalePartFiles() {
+    /// Returns the set of model IDs currently being downloaded.
+    public var activeModelIds: Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return Set(activeDownloads.keys)
+    }
+
+    /// Whether a download is currently active for the given model ID.
+    public func isDownloading(modelId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeDownloads[modelId] != nil
+    }
+
+    /// Reconnects orphaned background downloads that survived an app kill.
+    /// Call this before `cleanupStalePartFiles()`.
+    public func resumeOrphanedDownloads(
+        descriptorProvider: (String) -> DustModelDescriptor?
+    ) async {
+        guard let bgEngine = dataSource as? BackgroundDownloadEngine else { return }
+        let reconnected = await bgEngine.reconnectPendingTasks()
+
+        for download in reconnected {
+            guard let descriptor = descriptorProvider(download.modelId) else { continue }
+            let expectedHash = descriptor.sha256?.lowercased() ?? ""
+
+            lock.lock()
+            if activeDownloads[descriptor.id] != nil {
+                lock.unlock()
+                continue
+            }
+            let entry = ActiveDownload(url: download.url)
+            let task = Task {
+                await Task.yield()
+                do {
+                    try await consumeReconnectedStream(
+                        descriptor: descriptor,
+                        chunks: download.chunks,
+                        expectedHash: expectedHash
+                    )
+                } catch {
+                    handleFailure(for: descriptor, error: error)
+                }
+                finishDownload(for: descriptor.id, entry: entry)
+            }
+            entry.task = task
+            activeDownloads[descriptor.id] = entry
+            lock.unlock()
+
+            stateStore.setStatus(.downloading(progress: 0), for: descriptor.id)
+        }
+    }
+
+    private func consumeReconnectedStream(
+        descriptor: DustModelDescriptor,
+        chunks: AsyncThrowingStream<DownloadChunk, Error>,
+        expectedHash: String
+    ) async throws {
+        let modelDirectory = baseDirectory
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(descriptor.id, isDirectory: true)
+        try fileManager.createDirectory(
+            at: modelDirectory,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+
+        let partFileURL = modelDirectory.appendingPathComponent("\(descriptor.id).part", isDirectory: false)
+        let finalFileURL = modelDirectory.appendingPathComponent("\(descriptor.id).bin", isDirectory: false)
+
+        if fileManager.fileExists(atPath: partFileURL.path) {
+            try fileManager.removeItem(at: partFileURL)
+        }
+
+        fileManager.createFile(atPath: partFileURL.path, contents: nil)
+        let fileHandle = try FileHandle(forWritingTo: partFileURL)
+        defer { try? fileHandle.close() }
+
+        var hasher = SHA256()
+        var totalBytesReceived: Int64 = 0
+        var lastProgressEventBytes: Int64 = 0
+        let progressDenominator = max(descriptor.sizeBytes, 1)
+
+        for try await chunk in chunks {
+            try Task.checkCancellation()
+
+            if !chunk.data.isEmpty {
+                hasher.update(data: chunk.data)
+                try fileHandle.write(contentsOf: chunk.data)
+            }
+
+            totalBytesReceived = chunk.totalBytesReceived
+            let progress = min(Float(totalBytesReceived) / Float(progressDenominator), 1)
+            stateStore.setStatus(.downloading(progress: progress), for: descriptor.id)
+
+            if shouldEmitProgress(
+                currentBytes: totalBytesReceived,
+                lastEmittedBytes: lastProgressEventBytes
+            ) {
+                emitProgress(
+                    modelId: descriptor.id,
+                    progress: progress,
+                    bytesDownloaded: totalBytesReceived,
+                    totalBytes: descriptor.sizeBytes > 0 ? descriptor.sizeBytes : nil
+                )
+                lastProgressEventBytes = totalBytesReceived
+            }
+        }
+
+        if totalBytesReceived > lastProgressEventBytes {
+            let progress = min(Float(totalBytesReceived) / Float(progressDenominator), 1)
+            emitProgress(
+                modelId: descriptor.id,
+                progress: progress,
+                bytesDownloaded: totalBytesReceived,
+                totalBytes: descriptor.sizeBytes > 0 ? descriptor.sizeBytes : nil
+            )
+        }
+
+        try fileHandle.synchronize()
+        stateStore.setStatus(.verifying, for: descriptor.id)
+
+        let actualHash = hexDigest(hasher.finalize())
+        guard actualHash == expectedHash else {
+            throw DustCoreError.verificationFailed(
+                detail: "Expected \(expectedHash), received \(actualHash)"
+            )
+        }
+
+        if fileManager.fileExists(atPath: finalFileURL.path) {
+            try fileManager.removeItem(at: finalFileURL)
+        }
+
+        try fileManager.moveItem(at: partFileURL, to: finalFileURL)
+        stateStore.updateState(for: descriptor.id) { state in
+            state.status = .ready
+            state.filePath = finalFileURL.path
+        }
+        eventEmitter("modelReady", [
+            "modelId": descriptor.id,
+            "path": finalFileURL.path,
+        ])
+    }
+
+    public func cleanupStalePartFiles(activeModelIds: Set<String> = []) {
         let modelsDirectory = baseDirectory.appendingPathComponent("models", isDirectory: true)
         guard let modelDirectories = try? fileManager.contentsOfDirectory(
             at: modelsDirectory,
@@ -235,6 +384,8 @@ public final class DownloadManager: @unchecked Sendable {
 
         for modelDirectory in modelDirectories {
             let modelId = modelDirectory.lastPathComponent
+            if activeModelIds.contains(modelId) { continue }
+
             guard let fileURLs = try? fileManager.contentsOfDirectory(
                 at: modelDirectory,
                 includingPropertiesForKeys: nil,

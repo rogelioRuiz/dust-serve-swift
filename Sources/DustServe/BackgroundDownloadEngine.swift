@@ -33,7 +33,85 @@ public final class BackgroundDownloadEngine: NSObject, DownloadDataSource, URLSe
         )
     }
 
-    public func download(from url: URL) async throws -> (
+    // MARK: - URL-to-modelId persistence
+
+    private var urlMapFileURL: URL {
+        resumeDataDirectory.appendingPathComponent("url-model-map.plist", isDirectory: false)
+    }
+
+    private func loadURLToModelIdMap() -> [String: String] {
+        guard let data = try? Data(contentsOf: urlMapFileURL),
+              let dict = try? PropertyListSerialization.propertyList(
+                  from: data, format: nil) as? [String: String]
+        else { return [:] }
+        return dict
+    }
+
+    private func saveURLToModelIdMap(_ map: [String: String]) {
+        guard let data = try? PropertyListSerialization.data(
+            fromPropertyList: map, format: .binary, options: 0
+        ) else { return }
+        try? data.write(to: urlMapFileURL, options: .atomic)
+    }
+
+    private func persistURLMapping(url: URL, modelId: String) {
+        var map = loadURLToModelIdMap()
+        map[url.absoluteString] = modelId
+        saveURLToModelIdMap(map)
+    }
+
+    private func removeURLMapping(url: URL) {
+        var map = loadURLToModelIdMap()
+        map.removeValue(forKey: url.absoluteString)
+        saveURLToModelIdMap(map)
+    }
+
+    // MARK: - Reconnect pending tasks after app relaunch
+
+    public struct ReconnectedDownload {
+        public let url: URL
+        public let modelId: String
+        public let chunks: AsyncThrowingStream<DownloadChunk, Error>
+    }
+
+    /// Reconnects URLSession download tasks that survived an app kill.
+    /// Returns stream handles for each active download so the DownloadManager can consume them.
+    public func reconnectPendingTasks() async -> [ReconnectedDownload] {
+        let tasks = await session.allTasks
+        let urlToModelId = loadURLToModelIdMap()
+        var reconnected: [ReconnectedDownload] = []
+
+        for task in tasks {
+            guard let downloadTask = task as? URLSessionDownloadTask,
+                  let url = task.originalRequest?.url ?? task.currentRequest?.url,
+                  let modelId = urlToModelId[url.absoluteString],
+                  task.state == .running || task.state == .suspended
+            else { continue }
+
+            let stream = AsyncThrowingStream<DownloadChunk, Error> { continuation in
+                let state = DownloadState(url: url, continuation: continuation)
+                self.lock.lock()
+                self.statesByTaskIdentifier[downloadTask.taskIdentifier] = state
+                self.taskIdentifiersByURL[url] = downloadTask.taskIdentifier
+                self.lock.unlock()
+            }
+
+            reconnected.append(ReconnectedDownload(url: url, modelId: modelId, chunks: stream))
+        }
+
+        return reconnected
+    }
+
+    /// Checks if there is a persisted URL mapping for the given model ID,
+    /// indicating a download was in progress when the app was killed.
+    public func hasPersistedDownload(forModelId modelId: String) -> Bool {
+        let map = loadURLToModelIdMap()
+        return map.values.contains(modelId)
+    }
+
+    // MARK: - DownloadDataSource
+
+    public func download(from url: URL, modelId: String? = nil) async throws -> (
         preflight: DownloadPreflightInfo,
         chunks: AsyncThrowingStream<DownloadChunk, Error>
     ) {
@@ -42,6 +120,10 @@ public final class BackgroundDownloadEngine: NSObject, DownloadDataSource, URLSe
             withIntermediateDirectories: true,
             attributes: nil
         )
+
+        if let modelId {
+            persistURLMapping(url: url, modelId: modelId)
+        }
 
         let stream = AsyncThrowingStream<DownloadChunk, Error> { continuation in
             let task = self.makeDownloadTask(for: url)
@@ -56,6 +138,13 @@ public final class BackgroundDownloadEngine: NSObject, DownloadDataSource, URLSe
         }
 
         return (DownloadPreflightInfo(contentLength: nil), stream)
+    }
+
+    public func download(from url: URL) async throws -> (
+        preflight: DownloadPreflightInfo,
+        chunks: AsyncThrowingStream<DownloadChunk, Error>
+    ) {
+        return try await download(from: url, modelId: nil)
     }
 
     public func cancel(url: URL) {
@@ -111,6 +200,7 @@ public final class BackgroundDownloadEngine: NSObject, DownloadDataSource, URLSe
             state.continuation.finish()
             state.isCompleted = true
             clearResumeData(for: state.url)
+            removeURLMapping(url: state.url)
         } catch {
             state.continuation.finish(throwing: error)
             state.isCompleted = true
