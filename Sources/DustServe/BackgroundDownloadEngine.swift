@@ -80,6 +80,7 @@ public final class BackgroundDownloadEngine: NSObject, DownloadDataSource, URLSe
         let tasks = await session.allTasks
         let urlToModelId = loadURLToModelIdMap()
         var reconnected: [ReconnectedDownload] = []
+        var reconnectedURLs = Set<String>()
 
         for task in tasks {
             guard let downloadTask = task as? URLSessionDownloadTask,
@@ -88,6 +89,7 @@ public final class BackgroundDownloadEngine: NSObject, DownloadDataSource, URLSe
                   task.state == .running || task.state == .suspended
             else { continue }
 
+            reconnectedURLs.insert(url.absoluteString)
             let stream = AsyncThrowingStream<DownloadChunk, Error> { continuation in
                 let state = DownloadState(url: url, continuation: continuation)
                 self.lock.lock()
@@ -97,6 +99,16 @@ public final class BackgroundDownloadEngine: NSObject, DownloadDataSource, URLSe
             }
 
             reconnected.append(ReconnectedDownload(url: url, modelId: modelId, chunks: stream))
+        }
+
+        // Clean up stale URL mappings for tasks that no longer exist (e.g. killed on simulator)
+        let staleURLs = Set(urlToModelId.keys).subtracting(reconnectedURLs)
+        if !staleURLs.isEmpty {
+            var updatedMap = urlToModelId
+            for url in staleURLs {
+                updatedMap.removeValue(forKey: url)
+            }
+            saveURLToModelIdMap(updatedMap)
         }
 
         return reconnected
