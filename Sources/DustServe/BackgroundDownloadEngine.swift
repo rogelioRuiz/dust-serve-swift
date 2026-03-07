@@ -203,11 +203,19 @@ public final class BackgroundDownloadEngine: NSObject, DownloadDataSource, URLSe
         guard let state = state(for: downloadTask.taskIdentifier) else { return }
 
         do {
-            let data = try Data(contentsOf: location)
-            let totalBytesReceived = max(state.lastTotalBytesReceived, Int64(data.count))
+            // Move the downloaded file to a stable temp location before the
+            // delegate method returns (iOS deletes the original afterwards).
+            // This avoids loading multi-GB files entirely into memory.
+            let stableURL = resumeDataDirectory
+                .appendingPathComponent(UUID().uuidString + ".download", isDirectory: false)
+            try fileManager.moveItem(at: location, to: stableURL)
+
+            let attrs = try fileManager.attributesOfItem(atPath: stableURL.path)
+            let fileSize = (attrs[.size] as? Int64) ?? 0
+            let totalBytesReceived = max(state.lastTotalBytesReceived, fileSize)
             state.lastTotalBytesReceived = totalBytesReceived
             state.continuation.yield(
-                DownloadChunk(data: data, totalBytesReceived: totalBytesReceived)
+                DownloadChunk(data: Data(), totalBytesReceived: totalBytesReceived, fileURL: stableURL)
             )
             state.continuation.finish()
             state.isCompleted = true

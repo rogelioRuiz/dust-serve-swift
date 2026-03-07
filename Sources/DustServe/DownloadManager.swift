@@ -187,11 +187,14 @@ public final class DownloadManager: @unchecked Sendable {
         var totalBytesReceived: Int64 = 0
         var lastProgressEventBytes: Int64 = 0
         let progressDenominator = max(max(disclosedSize, descriptor.sizeBytes), 1)
+        var receivedFileURL: URL?
 
         for try await chunk in chunks {
             try Task.checkCancellation()
 
-            if !chunk.data.isEmpty {
+            if let chunkFileURL = chunk.fileURL {
+                receivedFileURL = chunkFileURL
+            } else if !chunk.data.isEmpty {
                 hasher.update(data: chunk.data)
                 try fileHandle.write(contentsOf: chunk.data)
             }
@@ -224,10 +227,21 @@ public final class DownloadManager: @unchecked Sendable {
             )
         }
 
-        try fileHandle.synchronize()
+        try fileHandle.close()
+
+        if let srcURL = receivedFileURL {
+            try? fileManager.removeItem(at: partFileURL)
+            try fileManager.moveItem(at: srcURL, to: partFileURL)
+        }
+
         stateStore.setStatus(.verifying, for: descriptor.id)
 
-        let actualHash = hexDigest(hasher.finalize())
+        let actualHash: String
+        if receivedFileURL != nil {
+            actualHash = try hashFile(at: partFileURL)
+        } else {
+            actualHash = hexDigest(hasher.finalize())
+        }
         guard actualHash == expectedHash else {
             throw DustCoreError.verificationFailed(
                 detail: "Expected \(expectedHash), received \(actualHash)"
@@ -339,11 +353,15 @@ public final class DownloadManager: @unchecked Sendable {
 
             var hasher = SHA256()
             var fileBytesReceived: Int64 = 0
+            var receivedFileURL: URL?
 
             for try await chunk in chunks {
                 try Task.checkCancellation()
 
-                if !chunk.data.isEmpty {
+                // File-based chunk: the engine already wrote the data to disk.
+                if let chunkFileURL = chunk.fileURL {
+                    receivedFileURL = chunkFileURL
+                } else if !chunk.data.isEmpty {
                     hasher.update(data: chunk.data)
                     try fileHandle.write(contentsOf: chunk.data)
                 }
@@ -364,16 +382,38 @@ public final class DownloadManager: @unchecked Sendable {
                 }
             }
 
-            try fileHandle.synchronize()
+            try fileHandle.close()
+
+            // If the engine delivered a file on disk, move it to partFile
+            // (replacing the empty one we created above).
+            if let srcURL = receivedFileURL {
+                try? fileManager.removeItem(at: partFileURL)
+                try fileManager.moveItem(at: srcURL, to: partFileURL)
+            } else {
+                // Data was written incrementally — just synchronize.
+                let fh = try FileHandle(forWritingTo: partFileURL)
+                try fh.synchronize()
+                try fh.close()
+            }
 
             // Verify this file's SHA-256 (skip if no hash provided)
             if let expectedHash = entry.sha256?.lowercased(), !expectedHash.isEmpty {
                 stateStore.setStatus(.verifying, for: descriptor.id)
-                let actualHash = hexDigest(hasher.finalize())
-                guard actualHash == expectedHash else {
-                    throw DustCoreError.verificationFailed(
-                        detail: "File \(entry.filename): expected \(expectedHash), received \(actualHash)"
-                    )
+                if receivedFileURL != nil {
+                    // Hash from disk since data wasn't streamed through hasher
+                    let actualHash = try hashFile(at: partFileURL)
+                    guard actualHash == expectedHash else {
+                        throw DustCoreError.verificationFailed(
+                            detail: "File \(entry.filename): expected \(expectedHash), received \(actualHash)"
+                        )
+                    }
+                } else {
+                    let actualHash = hexDigest(hasher.finalize())
+                    guard actualHash == expectedHash else {
+                        throw DustCoreError.verificationFailed(
+                            detail: "File \(entry.filename): expected \(expectedHash), received \(actualHash)"
+                        )
+                    }
                 }
             }
 
@@ -405,8 +445,8 @@ public final class DownloadManager: @unchecked Sendable {
         ])
     }
 
-    private func verifyFileHash(at fileURL: URL, expected: String) -> Bool {
-        guard let fileHandle = try? FileHandle(forReadingFrom: fileURL) else { return false }
+    private func hashFile(at fileURL: URL) throws -> String {
+        let fileHandle = try FileHandle(forReadingFrom: fileURL)
         defer { try? fileHandle.close() }
 
         var hasher = SHA256()
@@ -415,7 +455,12 @@ public final class DownloadManager: @unchecked Sendable {
             if data.isEmpty { break }
             hasher.update(data: data)
         }
-        return hexDigest(hasher.finalize()) == expected
+        return hexDigest(hasher.finalize())
+    }
+
+    private func verifyFileHash(at fileURL: URL, expected: String) -> Bool {
+        guard let hash = try? hashFile(at: fileURL) else { return false }
+        return hash == expected
     }
 
     private func handleFailure(for descriptor: DustModelDescriptor, error: Error) {
@@ -556,11 +601,14 @@ public final class DownloadManager: @unchecked Sendable {
         var totalBytesReceived: Int64 = 0
         var lastProgressEventBytes: Int64 = 0
         let progressDenominator = max(descriptor.sizeBytes, 1)
+        var receivedFileURL: URL?
 
         for try await chunk in chunks {
             try Task.checkCancellation()
 
-            if !chunk.data.isEmpty {
+            if let chunkFileURL = chunk.fileURL {
+                receivedFileURL = chunkFileURL
+            } else if !chunk.data.isEmpty {
                 hasher.update(data: chunk.data)
                 try fileHandle.write(contentsOf: chunk.data)
             }
@@ -593,10 +641,21 @@ public final class DownloadManager: @unchecked Sendable {
             )
         }
 
-        try fileHandle.synchronize()
+        try fileHandle.close()
+
+        if let srcURL = receivedFileURL {
+            try? fileManager.removeItem(at: partFileURL)
+            try fileManager.moveItem(at: srcURL, to: partFileURL)
+        }
+
         stateStore.setStatus(.verifying, for: descriptor.id)
 
-        let actualHash = hexDigest(hasher.finalize())
+        let actualHash: String
+        if receivedFileURL != nil {
+            actualHash = try hashFile(at: partFileURL)
+        } else {
+            actualHash = hexDigest(hasher.finalize())
+        }
         guard actualHash == expectedHash else {
             throw DustCoreError.verificationFailed(
                 detail: "Expected \(expectedHash), received \(actualHash)"
