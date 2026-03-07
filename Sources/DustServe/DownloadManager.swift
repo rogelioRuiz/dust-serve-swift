@@ -7,7 +7,7 @@ import DustCore
 struct ManifestFileEntry: Codable, Sendable {
     let filename: String
     let url: String
-    let sha256: String
+    let sha256: String?
     let sizeBytes: Int64
 }
 
@@ -310,13 +310,21 @@ public final class DownloadManager: @unchecked Sendable {
 
             // Skip already-downloaded and verified files (resume support)
             if fileManager.fileExists(atPath: finalFileURL.path) {
-                if verifyFileHash(at: finalFileURL, expected: entry.sha256.lowercased()) {
+                if let expectedHash = entry.sha256?.lowercased(), !expectedHash.isEmpty {
+                    if verifyFileHash(at: finalFileURL, expected: expectedHash) {
+                        globalBytesDownloaded += entry.sizeBytes
+                        let progress = min(Float(globalBytesDownloaded) / Float(totalSize), 1)
+                        stateStore.setStatus(.downloading(progress: progress), for: descriptor.id)
+                        continue
+                    }
+                    try fileManager.removeItem(at: finalFileURL)
+                } else {
+                    // No hash to verify — trust existing file
                     globalBytesDownloaded += entry.sizeBytes
                     let progress = min(Float(globalBytesDownloaded) / Float(totalSize), 1)
                     stateStore.setStatus(.downloading(progress: progress), for: descriptor.id)
                     continue
                 }
-                try fileManager.removeItem(at: finalFileURL)
             }
 
             if fileManager.fileExists(atPath: partFileURL.path) {
@@ -358,13 +366,15 @@ public final class DownloadManager: @unchecked Sendable {
 
             try fileHandle.synchronize()
 
-            // Verify this file's SHA-256
-            stateStore.setStatus(.verifying, for: descriptor.id)
-            let actualHash = hexDigest(hasher.finalize())
-            guard actualHash == entry.sha256.lowercased() else {
-                throw DustCoreError.verificationFailed(
-                    detail: "File \(entry.filename): expected \(entry.sha256), received \(actualHash)"
-                )
+            // Verify this file's SHA-256 (skip if no hash provided)
+            if let expectedHash = entry.sha256?.lowercased(), !expectedHash.isEmpty {
+                stateStore.setStatus(.verifying, for: descriptor.id)
+                let actualHash = hexDigest(hasher.finalize())
+                guard actualHash == expectedHash else {
+                    throw DustCoreError.verificationFailed(
+                        detail: "File \(entry.filename): expected \(expectedHash), received \(actualHash)"
+                    )
+                }
             }
 
             if fileManager.fileExists(atPath: finalFileURL.path) {
