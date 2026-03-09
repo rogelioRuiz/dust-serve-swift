@@ -204,6 +204,48 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(count, 20)
     }
 
+    func testTaskFactoryOverridesFormatFactory() async throws {
+        let stateStore = makeReadyStateStore()
+        let formatFactory = MockModelSessionFactory()
+        let taskFactory = MockModelSessionFactory()
+        let manager = SessionManager(stateStore: stateStore)
+
+        manager.setFactory(formatFactory, for: DustModelFormat.onnx.rawValue)
+        manager.setFactory(taskFactory, for: "embeddings")
+
+        _ = try await manager.loadModel(
+            descriptor: makeDescriptor(
+                format: .onnx,
+                metadata: ["task": "embeddings"]
+            ),
+            priority: .interactive
+        )
+
+        let formatCount = await formatFactory.createdCount()
+        let taskCount = await taskFactory.createdCount()
+        XCTAssertEqual(formatCount, 0)
+        XCTAssertEqual(taskCount, 1)
+    }
+
+    func testFormatFactoryFallbackUsedWhenTaskFactoryMissing() async throws {
+        let stateStore = makeReadyStateStore()
+        let formatFactory = MockModelSessionFactory()
+        let manager = SessionManager(stateStore: stateStore)
+
+        manager.setFactory(formatFactory, for: DustModelFormat.onnx.rawValue)
+
+        _ = try await manager.loadModel(
+            descriptor: makeDescriptor(
+                format: .onnx,
+                metadata: ["task": "embeddings"]
+            ),
+            priority: .interactive
+        )
+
+        let formatCount = await formatFactory.createdCount()
+        XCTAssertEqual(formatCount, 1)
+    }
+
     func testBackgroundZeroRefsEvictedOnStandard() async throws {
         let stateStore = makeReadyStateStore()
         let factory = MockModelSessionFactory()
@@ -347,13 +389,18 @@ final class SessionManagerTests: XCTestCase {
         return stateStore
     }
 
-    private func makeDescriptor(id: String = "model-a") -> DustModelDescriptor {
+    private func makeDescriptor(
+        id: String = "model-a",
+        format: DustModelFormat = .gguf,
+        metadata: [String: String]? = nil
+    ) -> DustModelDescriptor {
         DustModelDescriptor(
             id: id,
             name: "Model A",
-            format: .gguf,
+            format: format,
             sizeBytes: 1_024,
-            version: "1.0.0"
+            version: "1.0.0",
+            metadata: metadata
         )
     }
 }

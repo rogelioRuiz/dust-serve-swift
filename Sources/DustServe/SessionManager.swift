@@ -11,23 +11,28 @@ public final class SessionManager: @unchecked Sendable {
     public let inferenceQueue = DispatchQueue(label: "com.t6x.modelserver.inference")
 
     private let stateStore: ModelStateStore
-    private var factory: any DustModelSessionFactory
+    private var factories: [String: any DustModelSessionFactory] = [:]
     private let lock = NSLock()
     private var cachedSessions: [String: CachedSession] = [:]
 
     public init(
         stateStore: ModelStateStore,
-        factory: any DustModelSessionFactory
+        factory: (any DustModelSessionFactory)? = nil
     ) {
         self.stateStore = stateStore
-        self.factory = factory
+        if let factory {
+            setFactory(factory)
+        }
     }
 
-    /// Swaps the session factory. Must be called before any sessions are loaded.
-    public func setFactory(_ newFactory: any DustModelSessionFactory) {
+    public func setFactory(_ factory: any DustModelSessionFactory, for key: String) {
         lock.lock(); defer { lock.unlock() }
-        precondition(cachedSessions.isEmpty, "Cannot swap factory while sessions are active")
-        factory = newFactory
+        factories[key] = factory
+    }
+
+    public func setFactory(_ factory: any DustModelSessionFactory) {
+        setFactory(factory, for: DustModelFormat.gguf.rawValue)
+        setFactory(factory, for: DustModelFormat.onnx.rawValue)
     }
 
     public func loadModel(
@@ -46,6 +51,7 @@ public final class SessionManager: @unchecked Sendable {
             throw DustCoreError.modelNotReady
         }
 
+        let factory = try resolveFactory(for: descriptor)
         let createdSession = try await factory.makeSession(descriptor: descriptor, priority: priority)
 
         var installedSession: (any DustModelSession)?
@@ -185,6 +191,19 @@ public final class SessionManager: @unchecked Sendable {
         _ = stateStore.updateState(for: id) { state in
             state.refCount = refCount
         }
+    }
+
+    private func resolveFactory(for descriptor: DustModelDescriptor) throws -> any DustModelSessionFactory {
+        lock.lock()
+        let factory = descriptor.metadata?["task"].flatMap { factories[$0] }
+            ?? factories[descriptor.format.rawValue]
+        lock.unlock()
+
+        guard let factory else {
+            throw DustCoreError.formatUnsupported
+        }
+
+        return factory
     }
 }
 
